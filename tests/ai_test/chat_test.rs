@@ -1,4 +1,5 @@
-use crate::ai_test::util::read_text_from_asset;
+use crate::ai_test::util::{extract_image_url, read_text_from_asset};
+use std::time::Duration;
 
 use appflowy_ai_client::dto::{
   ChatQuestionQuery, OutputContent, OutputContentMetadata, OutputLayout, ResponseFormat,
@@ -360,7 +361,7 @@ async fn get_text_with_image_message_test() {
     .unwrap();
 
   let query = ChatQuestionQuery {
-    chat_id,
+    chat_id: chat_id.clone(),
     question_id: question.message_id,
     format: ResponseFormat {
       output_layout: OutputLayout::SimpleTable,
@@ -381,6 +382,47 @@ async fn get_text_with_image_message_test() {
     .unwrap();
   let answer = collect_answer(answer_stream).await;
   println!("answer:\n{}", answer);
+  let image_url = extract_image_url(&answer).unwrap();
+  let (workspace_id_2, chat_id_2, file_id_2) = test_client
+    .api_client
+    .parse_blob_url_v1(&image_url)
+    .unwrap();
+  assert_eq!(workspace_id, workspace_id_2);
+  assert_eq!(chat_id, chat_id_2);
+
+  let mut retries = 6;
+  let retry_interval = Duration::from_secs(20);
+  let mut last_error = None;
+
+  // The image will be generated in the background, so we need to retry until it's available
+  while retries > 0 {
+    match test_client
+      .api_client
+      .get_blob_v1(&workspace_id_2, &chat_id_2, &file_id_2)
+      .await
+    {
+      Ok(_) => {
+        // Success, exit the loop
+        last_error = None;
+        break;
+      },
+      Err(err) => {
+        eprintln!("Failed to get blob: {:?}", err);
+        // Save the error and retry
+        last_error = Some(err);
+        retries -= 1;
+      },
+    }
+
+    if retries > 0 {
+      tokio::time::sleep(retry_interval).await;
+    }
+  }
+
+  if let Some(err) = last_error {
+    panic!("Failed to get blob after retries: {:?}", err);
+  }
+
   assert!(!answer.is_empty());
 }
 
@@ -450,6 +492,7 @@ async fn collect_answer(mut stream: QuestionStream) -> String {
         answer.push_str(&value);
       },
       QuestionStreamValue::Metadata { .. } => {},
+      QuestionStreamValue::KeepAlive => {},
     }
   }
   answer

@@ -5,6 +5,8 @@ use database_entity::dto::{
 use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
+use crate::pg_row::AFPublishViewWithPublishInfo;
+
 pub async fn select_user_is_collab_publisher_for_all_views(
   pg_pool: &PgPool,
   user_uuid: &Uuid,
@@ -525,7 +527,7 @@ pub async fn select_default_published_view_id<'a, E: Executor<'a, Database = Pos
   Ok(res)
 }
 
-async fn select_first_non_original_namespace(
+async fn select_most_recent_non_original_namespace(
   pg_pool: &PgPool,
   namespace: &str,
 ) -> Result<Option<String>, AppError> {
@@ -535,7 +537,7 @@ async fn select_first_non_original_namespace(
       FROM af_workspace_namespace
       WHERE workspace_id = (SELECT workspace_id FROM af_workspace_namespace WHERE namespace = $1)
         AND is_original = FALSE
-      ORDER BY created_at ASC
+      ORDER BY created_at DESC
       LIMIT 1
     "#,
     namespace,
@@ -575,7 +577,7 @@ pub async fn select_publish_info_for_view_ids(
     return Ok(res);
   }
   if let Some(non_original_namespace) =
-    select_first_non_original_namespace(pg_pool, &res[0].namespace).await?
+    select_most_recent_non_original_namespace(pg_pool, &res[0].namespace).await?
   {
     res.iter_mut().for_each(|info| {
       info.namespace.clone_from(&non_original_namespace);
@@ -633,7 +635,7 @@ async fn use_non_orginal_namespace_if_possible(
   }
 
   if let Some(non_original_namespace) =
-    select_first_non_original_namespace(pg_pool, &publish_infos[0].namespace).await?
+    select_most_recent_non_original_namespace(pg_pool, &publish_infos[0].namespace).await?
   {
     publish_infos.iter_mut().for_each(|info| {
       info.namespace.clone_from(&non_original_namespace);
@@ -668,6 +670,34 @@ pub async fn select_published_view_ids_for_workspace<'a, E: Executor<'a, Databas
     r#"
       SELECT view_id
       FROM af_published_collab
+      WHERE workspace_id = $1
+      AND unpublished_at IS NULL
+    "#,
+    workspace_id,
+  )
+  .fetch_all(executor)
+  .await?;
+
+  Ok(res)
+}
+
+pub async fn select_published_view_ids_with_publish_info_for_workspace<
+  'a,
+  E: Executor<'a, Database = Postgres>,
+>(
+  executor: E,
+  workspace_id: Uuid,
+) -> Result<Vec<AFPublishViewWithPublishInfo>, AppError> {
+  let res = sqlx::query_as!(
+    AFPublishViewWithPublishInfo,
+    r#"
+      SELECT
+        apc.view_id,
+        apc.publish_name,
+        au.email AS publisher_email,
+        apc.created_at AS publish_timestamp
+      FROM af_published_collab apc
+      JOIN af_user au ON apc.published_by = au.uid
       WHERE workspace_id = $1
       AND unpublished_at IS NULL
     "#,
