@@ -3,11 +3,10 @@ use serde_json::json;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::str::FromStr;
-
 pub const STREAM_METADATA_KEY: &str = "0";
 pub const STREAM_ANSWER_KEY: &str = "1";
 pub const STREAM_IMAGE_KEY: &str = "2";
+pub const STREAM_KEEP_ALIVE_KEY: &str = "3";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SummarizeRowResponse {
   pub text: String,
@@ -45,20 +44,27 @@ pub struct ResponseFormat {
 #[derive(Clone, Debug, Default, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
 pub enum OutputLayout {
-  #[default]
   Paragraph = 0,
   BulletList = 1,
   NumberedList = 2,
   SimpleTable = 3,
+  #[default]
+  Flex = 4,
 }
 
-#[derive(Clone, Debug, Default, Serialize_repr, Deserialize_repr)]
+#[derive(Clone, Debug, Default, Serialize_repr, Deserialize_repr, Eq, PartialEq)]
 #[repr(u8)]
 pub enum OutputContent {
   #[default]
   TEXT = 0,
   IMAGE = 1,
   RichTextImage = 2,
+}
+
+impl OutputContent {
+  pub fn is_image(&self) -> bool {
+    *self == OutputContent::IMAGE || *self == OutputContent::RichTextImage
+  }
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
@@ -142,6 +148,7 @@ pub enum CompletionType {
   MakeShorter = 3,
   MakeLonger = 4,
   ContinueWriting = 5,
+  Explain = 6,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -333,44 +340,6 @@ impl Display for EmbeddingModel {
   }
 }
 
-#[derive(Debug, Clone, Default, Serialize_repr, Deserialize_repr)]
-#[repr(u8)]
-pub enum AIModel {
-  #[default]
-  DefaultModel = 0,
-  GPT4oMini = 1,
-  GPT4o = 2,
-  Claude3Sonnet = 3,
-  Claude3Opus = 4,
-}
-
-impl AIModel {
-  pub fn to_str(&self) -> &str {
-    match self {
-      AIModel::DefaultModel => "default-model",
-      AIModel::GPT4oMini => "gpt-4o-mini",
-      AIModel::GPT4o => "gpt-4o",
-      AIModel::Claude3Sonnet => "claude-3-sonnet",
-      AIModel::Claude3Opus => "claude-3-opus",
-    }
-  }
-}
-
-impl FromStr for AIModel {
-  type Err = anyhow::Error;
-
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    match s {
-      "gpt-3.5-turbo" => Ok(AIModel::GPT4oMini),
-      "gpt-4o-mini" => Ok(AIModel::GPT4oMini),
-      "gpt-4o" => Ok(AIModel::GPT4o),
-      "claude-3-sonnet" => Ok(AIModel::Claude3Sonnet),
-      "claude-3-opus" => Ok(AIModel::Claude3Opus),
-      _ => Ok(AIModel::DefaultModel),
-    }
-  }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RepeatedLocalAIPackage(pub Vec<AppFlowyOfflineAI>);
 
@@ -405,6 +374,18 @@ pub struct ModelInfo {
 pub struct LocalAIConfig {
   pub models: Vec<LLMModel>,
   pub plugin: AppFlowyOfflineAI,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AvailableModel {
+  pub name: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelList {
+  pub models: Vec<AvailableModel>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -464,4 +445,47 @@ pub struct CalculateSimilarityParams {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimilarityResponse {
   pub score: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompletionMetadata {
+  /// A unique identifier for the object.
+  pub object_id: String,
+  /// The workspace identifier.
+  ///
+  /// This field must be provided when generating images.
+  pub workspace_id: Option<String>,
+  /// A list of relevant document IDs.
+  ///
+  /// When using completions for document-related tasks, this should include the document ID.
+  /// In some cases, `object_id` may be the same as the document ID.
+  pub rag_ids: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompleteTextParams {
+  pub text: String,
+  pub completion_type: Option<CompletionType>,
+  pub custom_prompt: Option<CustomPrompt>,
+  #[serde(default)]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub metadata: Option<CompletionMetadata>,
+  #[serde(default)]
+  pub format: ResponseFormat,
+}
+
+impl CompleteTextParams {
+  pub fn new_with_completion_type(
+    text: String,
+    completion_type: CompletionType,
+    metadata: Option<CompletionMetadata>,
+  ) -> Self {
+    Self {
+      text,
+      completion_type: Some(completion_type),
+      custom_prompt: None,
+      metadata,
+      format: Default::default(),
+    }
+  }
 }

@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use access_control::collab::{CollabAccessControl, RealtimeAccessControl};
 use access_control::workspace::WorkspaceAccessControl;
-use collab::lock::Mutex;
 use dashmap::DashMap;
 use secrecy::{ExposeSecret, Secret};
 use sqlx::PgPool;
@@ -25,9 +24,9 @@ use gotrue::grant::{Grant, PasswordGrant};
 use indexer::metrics::EmbeddingMetrics;
 use indexer::scheduler::IndexerScheduler;
 use snowflake::Snowflake;
-use tonic_proto::history::history_client::HistoryClient;
 
 use crate::api::metrics::{AppFlowyWebMetrics, PublishedCollabMetrics, RequestMetrics};
+use crate::biz::chat::metrics::AIMetrics;
 use crate::biz::pg_listener::PgListeners;
 use crate::biz::workspace::publish::PublishedCollabStore;
 use crate::config::config::Config;
@@ -56,7 +55,6 @@ pub struct AppState {
   pub gotrue_admin: GoTrueAdmin,
   pub mailer: AFCloudMailer,
   pub ai_client: AppFlowyAIClient,
-  pub grpc_history_client: Arc<Mutex<HistoryClient<tonic::transport::Channel>>>,
   pub indexer_scheduler: Arc<IndexerScheduler>,
 }
 
@@ -130,6 +128,7 @@ pub struct AppMetrics {
   pub appflowy_web_metrics: Arc<AppFlowyWebMetrics>,
   pub embedding_metrics: Arc<EmbeddingMetrics>,
   pub collab_stream_metrics: Arc<CollabStreamMetrics>,
+  pub ai_metrics: Arc<AIMetrics>,
 }
 
 impl Default for AppMetrics {
@@ -149,6 +148,7 @@ impl AppMetrics {
     let appflowy_web_metrics = Arc::new(AppFlowyWebMetrics::register(&mut registry));
     let embedding_metrics = Arc::new(EmbeddingMetrics::register(&mut registry));
     let collab_stream_metrics = Arc::new(CollabStreamMetrics::register(&mut registry));
+    let ai_metrics = Arc::new(AIMetrics::register(&mut registry));
     Self {
       registry: Arc::new(registry),
       request_metrics,
@@ -159,6 +159,7 @@ impl AppMetrics {
       appflowy_web_metrics,
       embedding_metrics,
       collab_stream_metrics,
+      ai_metrics,
     }
   }
 }

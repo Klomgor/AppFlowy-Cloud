@@ -19,15 +19,14 @@ use yrs::updates::encoder::Encode;
 use access_control::workspace::WorkspaceAccessControl;
 use app_error::AppError;
 use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
-use database::collab::upsert_collab_member_with_txn;
 use database::file::s3_client_impl::S3BucketStorage;
 use database::pg_row::AFWorkspaceMemberRow;
 
 use database::user::select_uid_from_email;
 use database::workspace::*;
 use database_entity::dto::{
-  AFAccessLevel, AFRole, AFWorkspace, AFWorkspaceInvitation, AFWorkspaceInvitationStatus,
-  AFWorkspaceSettings, GlobalComment, Reaction, WorkspaceUsage,
+  AFRole, AFWorkspace, AFWorkspaceInvitation, AFWorkspaceInvitationStatus, AFWorkspaceSettings,
+  GlobalComment, Reaction, WorkspaceUsage,
 };
 use gotrue::params::{GenerateLinkParams, GenerateLinkType};
 
@@ -361,6 +360,7 @@ pub async fn invite_workspace_members(
   workspace_id: &Uuid,
   invitations: Vec<WorkspaceMemberInvitation>,
   appflowy_web_url: Option<&str>,
+  admin_frontend_path_prefix: &str,
 ) -> Result<(), AppError> {
   let mut txn = pg_pool
     .begin()
@@ -432,7 +432,10 @@ pub async fn invite_workspace_members(
     // Generate a link such that when clicked, the user is added to the workspace.
     let accept_url = {
       match appflowy_web_url {
-        Some(appflowy_web_url) => format!("{}/accept-invitation?invited_id={}", appflowy_web_url, invite_id),
+        Some(appflowy_web_url) => format!(
+          "{}/accept-invitation?invited_id={}",
+          appflowy_web_url, invite_id
+        ),
         None => {
           gotrue_client
           .admin_generate_link(
@@ -441,8 +444,10 @@ pub async fn invite_workspace_members(
               type_: GenerateLinkType::MagicLink,
               email: invitation.email.clone(),
               redirect_to: format!(
-                "/web/login-callback?action=accept_workspace_invite&workspace_invitation_id={}&workspace_name={}&workspace_icon={}&user_name={}&user_icon={}&workspace_member_count={}",
-                invite_id, workspace_name,
+                "{}/web/login-callback?action=accept_workspace_invite&workspace_invitation_id={}&workspace_name={}&workspace_icon={}&user_name={}&user_icon={}&workspace_member_count={}",
+                admin_frontend_path_prefix,
+                invite_id,
+                workspace_name,
                 workspace_icon_url,
                 inviter_name,
                 user_icon_url,
@@ -532,16 +537,8 @@ pub async fn add_workspace_members_db_only(
     .context("Begin transaction to insert workspace members")?;
 
   for member in members.into_iter() {
-    let access_level = match &member.role {
-      AFRole::Owner => AFAccessLevel::FullAccess,
-      AFRole::Member => AFAccessLevel::ReadAndWrite,
-      AFRole::Guest => AFAccessLevel::ReadOnly,
-    };
-
-    let uid = select_uid_from_email(txn.deref_mut(), &member.email).await?;
     upsert_workspace_member_with_txn(&mut txn, workspace_id, &member.email, member.role.clone())
       .await?;
-    upsert_collab_member_with_txn(uid, workspace_id.to_string(), &access_level, &mut txn).await?;
   }
 
   txn
@@ -605,6 +602,14 @@ pub async fn get_workspace_member(
   workspace_id: &Uuid,
 ) -> Result<AFWorkspaceMemberRow, AppResponseError> {
   Ok(select_workspace_member(pg_pool, uid, workspace_id).await?)
+}
+
+pub async fn get_workspace_member_by_uuid(
+  member_uuid: Uuid,
+  pg_pool: &PgPool,
+  workspace_id: Uuid,
+) -> Result<AFWorkspaceMemberRow, AppResponseError> {
+  Ok(select_workspace_member_by_uuid(pg_pool, member_uuid, workspace_id).await?)
 }
 
 pub async fn update_workspace_member(

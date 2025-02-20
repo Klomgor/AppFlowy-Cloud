@@ -472,10 +472,7 @@ pub async fn delete_workspace_members(
   .unwrap_or(false);
 
   if is_owner {
-    return Err(AppError::NotEnoughPermissions {
-      user: member_email.to_string(),
-      workspace_id: workspace_id.to_string(),
-    });
+    return Err(AppError::NotEnoughPermissions);
   }
 
   sqlx::query!(
@@ -552,6 +549,29 @@ pub async fn select_workspace_member<'a, E: Executor<'a, Database = Postgres>>(
     "#,
     workspace_id,
     uid,
+  )
+  .fetch_one(executor)
+  .await?;
+  Ok(member)
+}
+
+#[inline]
+pub async fn select_workspace_member_by_uuid<'a, E: Executor<'a, Database = Postgres>>(
+  executor: E,
+  uuid: Uuid,
+  workspace_id: Uuid,
+) -> Result<AFWorkspaceMemberRow, AppError> {
+  let member = sqlx::query_as!(
+    AFWorkspaceMemberRow,
+    r#"
+    SELECT af_user.uid, af_user.name, af_user.email, af_workspace_member.role_id AS role
+    FROM public.af_workspace_member
+      JOIN public.af_user ON af_workspace_member.uid = af_user.uid
+    WHERE af_workspace_member.workspace_id = $1
+    AND af_user.uuid = $2
+    "#,
+    workspace_id,
+    uuid,
   )
   .fetch_one(executor)
   .await?;

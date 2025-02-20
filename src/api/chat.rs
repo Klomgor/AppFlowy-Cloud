@@ -1,6 +1,6 @@
 use crate::biz::chat::ops::{
-  create_chat, create_chat_message, delete_chat, generate_chat_message_answer, get_chat_messages,
-  get_question_message, update_chat_message,
+  create_chat, create_chat_message, delete_chat, generate_chat_message_answer,
+  get_chat_messages_with_author_uuid, get_question_message, update_chat_message,
 };
 use crate::state::AppState;
 use actix_web::web::{Data, Json};
@@ -23,7 +23,7 @@ use pin_project::pin_project;
 use shared_entity::dto::chat_dto::{
   ChatAuthor, ChatMessage, ChatSettings, CreateAnswerMessageParams, CreateChatMessageParams,
   CreateChatMessageParamsV2, CreateChatParams, GetChatMessageParams, MessageCursor,
-  RepeatedChatMessage, UpdateChatMessageContentParams, UpdateChatParams,
+  RepeatedChatMessageWithAuthorUuid, UpdateChatMessageContentParams, UpdateChatParams,
 };
 use shared_entity::response::{AppResponse, JsonAppResponse};
 use std::collections::HashMap;
@@ -169,7 +169,7 @@ async fn get_related_message_handler(
   let ai_model = ai_model_from_header(&req);
   let resp = state
     .ai_client
-    .get_related_question(&chat_id, &message_id, &ai_model)
+    .get_related_question(&chat_id, &message_id, ai_model)
     .await
     .map_err(|err| AppError::Internal(err.into()))?;
   Ok(AppResponse::Ok().with_data(resp).into())
@@ -271,6 +271,7 @@ async fn answer_stream_handler(
     chat::chat_ops::select_chat_message_content(&state.pg_pool, question_id).await?;
   let rag_ids = chat::chat_ops::select_chat_rag_ids(&state.pg_pool, &chat_id).await?;
   let ai_model = ai_model_from_header(&req);
+  state.metrics.ai_metrics.record_total_stream_count(1);
   match state
     .ai_client
     .stream_question(
@@ -279,7 +280,7 @@ async fn answer_stream_handler(
       &content,
       Some(metadata),
       rag_ids,
-      &ai_model,
+      ai_model,
     )
     .await
   {
@@ -291,13 +292,16 @@ async fn answer_stream_handler(
           .streaming(new_answer_stream),
       )
     },
-    Err(err) => Ok(
-      HttpResponse::Ok()
-        .content_type("text/event-stream")
-        .streaming(stream::once(async move {
-          Err(AppError::AIServiceUnavailable(err.to_string()))
-        })),
-    ),
+    Err(err) => {
+      state.metrics.ai_metrics.record_failed_stream_count(1);
+      Ok(
+        HttpResponse::Ok()
+          .content_type("text/event-stream")
+          .streaming(stream::once(async move {
+            Err(AppError::AIServiceUnavailable(err.to_string()))
+          })),
+      )
+    },
   }
 }
 
@@ -313,6 +317,7 @@ async fn answer_stream_v2_handler(
   let rag_ids = chat::chat_ops::select_chat_rag_ids(&state.pg_pool, &chat_id).await?;
   let ai_model = ai_model_from_header(&req);
 
+  state.metrics.ai_metrics.record_total_stream_count(1);
   trace!(
     "[Chat] stream answer for chat: {}, question: {}, rag_ids: {:?}",
     chat_id,
@@ -328,7 +333,7 @@ async fn answer_stream_v2_handler(
       &content,
       Some(metadata),
       rag_ids,
-      &ai_model,
+      ai_model,
     )
     .await
   {
@@ -340,13 +345,16 @@ async fn answer_stream_v2_handler(
           .streaming(new_answer_stream),
       )
     },
-    Err(err) => Ok(
-      HttpResponse::ServiceUnavailable()
-        .content_type("text/event-stream")
-        .streaming(stream::once(async move {
-          Err(AppError::AIServiceUnavailable(err.to_string()))
-        })),
-    ),
+    Err(err) => {
+      state.metrics.ai_metrics.record_failed_stream_count(1);
+      Ok(
+        HttpResponse::ServiceUnavailable()
+          .content_type("text/event-stream")
+          .streaming(stream::once(async move {
+            Err(AppError::AIServiceUnavailable(err.to_string()))
+          })),
+      )
+    },
   }
 }
 
@@ -363,6 +371,10 @@ async fn answer_stream_v3_handler(
     chat::chat_ops::select_chat_message_content(&state.pg_pool, payload.question_id).await?;
   let rag_ids = chat::chat_ops::select_chat_rag_ids(&state.pg_pool, &payload.chat_id).await?;
   let ai_model = ai_model_from_header(&req);
+  state.metrics.ai_metrics.record_total_stream_count(1);
+  if payload.format.output_content.is_image() {
+    state.metrics.ai_metrics.record_stream_image_count(1);
+  }
 
   let question = ChatQuestion {
     chat_id: payload.chat_id,
@@ -377,10 +389,11 @@ async fn answer_stream_v3_handler(
       rag_ids,
     },
   };
+
   trace!("[Chat] stream v3 {:?}", question);
   match state
     .ai_client
-    .stream_question_v3(&ai_model, question)
+    .stream_question_v3(ai_model, question, Some(60))
     .await
   {
     Ok(answer_stream) => {
@@ -391,13 +404,16 @@ async fn answer_stream_v3_handler(
           .streaming(new_answer_stream),
       )
     },
-    Err(err) => Ok(
-      HttpResponse::ServiceUnavailable()
-        .content_type("text/event-stream")
-        .streaming(stream::once(async move {
-          Err(AppError::AIServiceUnavailable(err.to_string()))
-        })),
-    ),
+    Err(err) => {
+      state.metrics.ai_metrics.record_failed_stream_count(1);
+      Ok(
+        HttpResponse::ServiceUnavailable()
+          .content_type("text/event-stream")
+          .streaming(stream::once(async move {
+            Err(AppError::AIServiceUnavailable(err.to_string()))
+          })),
+      )
+    },
   }
 }
 
@@ -406,7 +422,7 @@ async fn get_chat_message_handler(
   path: web::Path<(String, String)>,
   query: web::Query<HashMap<String, String>>,
   state: Data<AppState>,
-) -> actix_web::Result<JsonAppResponse<RepeatedChatMessage>> {
+) -> actix_web::Result<JsonAppResponse<RepeatedChatMessageWithAuthorUuid>> {
   let mut params = GetChatMessageParams {
     cursor: MessageCursor::Offset(0),
     limit: query
@@ -426,7 +442,7 @@ async fn get_chat_message_handler(
 
   trace!("get chat messages: {:?}", params);
   let (_workspace_id, chat_id) = path.into_inner();
-  let messages = get_chat_messages(&state.pg_pool, params, &chat_id).await?;
+  let messages = get_chat_messages_with_author_uuid(&state.pg_pool, params, &chat_id).await?;
   Ok(AppResponse::Ok().with_data(messages).into())
 }
 

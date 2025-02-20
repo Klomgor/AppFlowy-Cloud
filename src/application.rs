@@ -18,7 +18,7 @@ use actix_session::storage::RedisSessionStore;
 use actix_session::SessionMiddleware;
 use actix_web::cookie::Key;
 use actix_web::middleware::NormalizePath;
-use actix_web::{dev::Server, web::Data, App, HttpServer};
+use actix_web::{dev::Server, web, web::Data, App, HttpResponse, HttpServer, Responder};
 use anyhow::{Context, Error};
 use appflowy_collaborate::collab::access_control::CollabStorageAccessControlImpl;
 use aws_sdk_s3::config::{Credentials, Region, SharedCredentialsProvider};
@@ -26,10 +26,7 @@ use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::types::{
   BucketInfo, BucketLocationConstraint, BucketType, CreateBucketConfiguration,
 };
-use collab::lock::Mutex;
 use mailer::config::MailerSetting;
-use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
-use openssl::x509::X509;
 use secrecy::{ExposeSecret, Secret};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::RwLock;
@@ -50,14 +47,12 @@ use indexer::scheduler::{IndexerConfiguration, IndexerScheduler};
 use infra::env_util::get_env_var;
 use mailer::sender::Mailer;
 use snowflake::Snowflake;
-use tonic_proto::history::history_client::HistoryClient;
 
 use crate::api::access_request::access_request_scope;
 use crate::api::ai::ai_completion_scope;
 use crate::api::chat::chat_scope;
 use crate::api::data_import::data_import_scope;
 use crate::api::file_storage::file_storage_scope;
-use crate::api::history::history_scope;
 use crate::api::metrics::metrics_scope;
 use crate::api::search::search_scope;
 use crate::api::server_info::server_info_scope;
@@ -75,7 +70,6 @@ use crate::config::config::{
 use crate::mailer::AFCloudMailer;
 use crate::middleware::metrics_mw::MetricsMiddleware;
 use crate::middleware::request_id::RequestIdMiddleware;
-use crate::self_signed::create_self_signed_certificate;
 use crate::state::{AppMetrics, AppState, GoTrueAdmin, UserCache};
 
 pub struct Application {
@@ -122,11 +116,6 @@ pub async fn run_actix_server(
         e
       )
     })?;
-  let pair = get_certificate_and_server_key(&config);
-  let key = pair
-    .as_ref()
-    .map(|(_, server_key)| Key::from(server_key.expose_secret().as_bytes()))
-    .unwrap_or_else(Key::generate);
 
   let storage = state.collab_access_control_storage.clone();
 
@@ -153,7 +142,7 @@ pub async fn run_actix_server(
       .wrap(MetricsMiddleware)
       .wrap(IdentityMiddleware::default())
       .wrap(
-        SessionMiddleware::builder(redis_store.clone(), key.clone())
+        SessionMiddleware::builder(redis_store.clone(), Key::generate())
           .build(),
       )
       .wrap(RequestIdMiddleware)
@@ -165,12 +154,12 @@ pub async fn run_actix_server(
       .service(file_storage_scope())
       .service(chat_scope())
       .service(ai_completion_scope())
-      .service(history_scope())
       .service(metrics_scope())
       .service(search_scope())
       .service(template_scope())
       .service(data_import_scope())
       .service(access_request_scope())
+      .route("/health", web::get().to(health_check))
       .app_data(Data::new(state.metrics.registry.clone()))
       .app_data(Data::new(state.metrics.request_metrics.clone()))
       .app_data(Data::new(state.metrics.realtime_metrics.clone()))
@@ -182,22 +171,9 @@ pub async fn run_actix_server(
       .app_data(Data::new(state.published_collab_store.clone()))
   });
 
-  server = match pair {
-    None => server.listen(listener)?,
-    Some((certificate, _)) => {
-      server.listen_openssl(listener, make_ssl_acceptor_builder(certificate))?
-    },
-  };
+  server = server.listen(listener)?;
 
   Ok(server.run())
-}
-
-fn get_certificate_and_server_key(config: &Config) -> Option<(Secret<String>, Secret<String>)> {
-  if config.application.use_tls {
-    Some(create_self_signed_certificate().unwrap())
-  } else {
-    None
-  }
 }
 
 pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<AppState, Error> {
@@ -215,6 +191,8 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
   let s3_client = AwsS3BucketClientImpl::new(
     get_aws_s3_client(&config.s3).await?,
     config.s3.bucket.clone(),
+    config.s3.minio_url.clone(),
+    config.s3.presigned_url_endpoint.clone(),
   );
   let bucket_storage = Arc::new(S3BucketStorage::from_bucket_impl(
     s3_client.clone(),
@@ -315,16 +293,6 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     rt_cmd_tx,
   ));
 
-  info!(
-    "Connecting to history server: {}",
-    config.grpc_history.addrs
-  );
-  let channel = tonic::transport::Channel::from_shared(config.grpc_history.addrs.clone())?
-    .keep_alive_timeout(Duration::from_secs(20))
-    .keep_alive_while_idle(true)
-    .connect_lazy();
-
-  let grpc_history_client = Arc::new(Mutex::new(HistoryClient::new(channel)));
   let mailer = get_mailer(&config.mailer).await?;
 
   info!("Setting up Indexer scheduler...");
@@ -371,7 +339,6 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     gotrue_admin,
     mailer,
     ai_client: appflowy_ai_client,
-    grpc_history_client,
     indexer_scheduler,
   })
 }
@@ -488,7 +455,7 @@ async fn create_bucket_if_not_exists(
         }
       } else {
         error!("Failed to create bucket: {:?}", err);
-        Ok(())
+        Err(err.into())
       }
     },
   }
@@ -539,21 +506,6 @@ async fn get_gotrue_client(setting: &GoTrueSetting) -> Result<gotrue::api::Clien
   Ok(gotrue_client)
 }
 
-fn make_ssl_acceptor_builder(certificate: Secret<String>) -> SslAcceptorBuilder {
-  let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-  let x509_cert = X509::from_pem(certificate.expose_secret().as_bytes()).unwrap();
-  builder.set_certificate(&x509_cert).unwrap();
-  builder
-    .set_private_key_file("./cert/key.pem", SslFiletype::PEM)
-    .unwrap();
-  builder
-    .set_certificate_chain_file("./cert/cert.pem")
-    .unwrap();
-  builder
-    .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
-    .unwrap();
-  builder
-    .set_max_proto_version(Some(openssl::ssl::SslVersion::TLS1_3))
-    .unwrap();
-  builder
+async fn health_check() -> impl Responder {
+  HttpResponse::Ok().body("OK")
 }

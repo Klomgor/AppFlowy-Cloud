@@ -251,7 +251,10 @@ pub async fn select_name_and_email_from_uuid(
   Ok((row.name, row.email))
 }
 
-pub async fn select_web_user_from_uid(pool: &PgPool, uid: i64) -> Result<AFWebUser, AppError> {
+pub async fn select_web_user_from_uid(
+  pool: &PgPool,
+  uid: i64,
+) -> Result<Option<AFWebUser>, AppError> {
   let row = sqlx::query_as!(
     AFWebUser,
     r#"
@@ -264,8 +267,9 @@ pub async fn select_web_user_from_uid(pool: &PgPool, uid: i64) -> Result<AFWebUs
     "#,
     uid
   )
-  .fetch_one(pool)
-  .await?;
+  .fetch_optional(pool)
+  .await
+  .map_err(|err| anyhow::anyhow!("Unable to get user detail for {}: {}", uid, err))?;
 
   Ok(row)
 }

@@ -198,6 +198,23 @@ pub struct AFCollabMemberRow {
   pub permission_id: i64,
 }
 
+#[derive(Serialize, Deserialize, Eq, PartialEq, Debug, Clone)]
+#[repr(i16)]
+pub enum AFBlobStatus {
+  Ok = 0,
+  DallEContentPolicyViolation = 1,
+}
+
+impl From<i16> for AFBlobStatus {
+  fn from(value: i16) -> Self {
+    match value {
+      0 => AFBlobStatus::Ok,
+      1 => AFBlobStatus::DallEContentPolicyViolation,
+      _ => AFBlobStatus::Ok,
+    }
+  }
+}
+
 #[derive(Debug, FromRow, Serialize, Deserialize)]
 pub struct AFBlobMetadataRow {
   pub workspace_id: Uuid,
@@ -205,6 +222,8 @@ pub struct AFBlobMetadataRow {
   pub file_type: String,
   pub file_size: i64,
   pub modified_at: DateTime<Utc>,
+  #[serde(default)]
+  pub status: i16,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -666,4 +685,13 @@ impl From<AFQuickNoteRow> for QuickNote {
       last_updated_at: value.updated_at,
     }
   }
+}
+
+pub struct AFPublishViewWithPublishInfo {
+  pub view_id: Uuid,
+  pub publish_name: String,
+  pub publisher_email: String,
+  pub publish_timestamp: DateTime<Utc>,
+  pub comments_enabled: bool,
+  pub duplicate_enabled: bool,
 }

@@ -50,6 +50,7 @@ use std::collections::{HashMap, HashSet};
 use std::env::temp_dir;
 use std::fmt::Display;
 use std::fs::Permissions;
+use std::io::ErrorKind;
 use std::ops::DerefMut;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -288,7 +289,23 @@ async fn consume_task(
       Some(file_size) => {
         if file_size > context.maximum_import_file_size as i64 {
           let file_size_in_mb = file_size as f64 / 1_048_576.0;
-          let max_size_in_mb = context.maximum_import_file_size as f64 / 1_048_576.0;
+          let max_size_in_mb = (context.maximum_import_file_size as f64 / 1_048_576.0).ceil();
+          if let Ok(import_record) = select_import_task(&context.pg_pool, &task.task_id).await {
+            handle_failed_task(
+              &mut context,
+              &import_record,
+              task,
+              stream_name,
+              group_name,
+              &entry_id,
+              ImportError::UploadFileTooLarge {
+                file_size_in_mb,
+                max_size_in_mb,
+              },
+              ImportTaskState::Failed,
+            )
+            .await?;
+          }
 
           return Err(ImportError::UploadFileTooLarge {
             file_size_in_mb,
@@ -299,16 +316,18 @@ async fn consume_task(
     }
 
     // Check if the task is expired
-    if let Err(err) = is_task_expired(task.created_at.unwrap(), task.last_process_at) {
+    if let Err(reason) = is_task_expired(task.created_at.unwrap(), task.last_process_at) {
       if let Ok(import_record) = select_import_task(&context.pg_pool, &task.task_id).await {
-        handle_expired_task(
+        error!("[Import] {} task is expired: {}", task.workspace_id, reason);
+        handle_failed_task(
           &mut context,
           &import_record,
           task,
           stream_name,
           group_name,
           &entry_id,
-          &err,
+          ImportError::UploadFileExpire,
+          ImportTaskState::Expire,
         )
         .await?;
       }
@@ -342,30 +361,28 @@ async fn consume_task(
   }
 }
 
-async fn handle_expired_task(
+#[allow(clippy::too_many_arguments)]
+async fn handle_failed_task(
   context: &mut TaskContext,
   import_record: &AFImportTask,
   task: &NotionImportTask,
   stream_name: &str,
   group_name: &str,
   entry_id: &str,
-  reason: &str,
+  error: ImportError,
+  task_state: ImportTaskState,
 ) -> Result<(), ImportError> {
   info!(
-    "[Import]: {} import is expired with reason:{}",
-    task.workspace_id, reason
+    "[Import]: {} import was failed with reason:{}",
+    task.workspace_id, error
   );
 
-  update_import_task_status(
-    &import_record.task_id,
-    ImportTaskState::Expire,
-    &context.pg_pool,
-  )
-  .await
-  .map_err(|e| {
-    error!("Failed to update import task status: {:?}", e);
-    ImportError::Internal(e.into())
-  })?;
+  update_import_task_status(&import_record.task_id, task_state, &context.pg_pool)
+    .await
+    .map_err(|e| {
+      error!("Failed to update import task status: {:?}", e);
+      ImportError::Internal(e.into())
+    })?;
   remove_workspace(&import_record.workspace_id, &context.pg_pool).await;
   info!("[Import]: deleted workspace {}", task.workspace_id);
 
@@ -375,19 +392,14 @@ async fn handle_expired_task(
       task.workspace_id, err
     );
   }
-  if let Err(err) = xack_task(&mut context.redis_client, stream_name, group_name, entry_id).await {
+  if let Err(err) = delete_task(&mut context.redis_client, stream_name, group_name, entry_id).await
+  {
     error!(
       "[Import] failed to acknowledge task:{} error:{:?}",
       task.workspace_id, err
     );
   }
-  notify_user(
-    task,
-    Err(ImportError::UploadFileExpire),
-    context.notifier.clone(),
-    &context.metrics,
-  )
-  .await?;
+  notify_user(task, Err(error), context.notifier.clone(), &context.metrics).await?;
   Ok(())
 }
 
@@ -409,7 +421,7 @@ async fn process_and_ack_task(
   entry_id: &str,
 ) -> Result<(), ImportError> {
   let result = process_task(context.clone(), import_task).await;
-  xack_task(&mut context.redis_client, stream_name, group_name, entry_id)
+  delete_task(&mut context.redis_client, stream_name, group_name, entry_id)
     .await
     .ok();
   result
@@ -471,7 +483,7 @@ fn is_task_expired(created_timestamp: i64, last_process_at: Option<i64>) -> Resu
 async fn push_task(
   redis_client: &mut ConnectionManager,
   stream_name: &str,
-  group_name: &str,
+  _group_name: &str,
   task: ImportTask,
   entry_id: &str,
 ) -> Result<(), ImportError> {
@@ -483,11 +495,10 @@ async fn push_task(
   let mut pipeline = redis::pipe();
   pipeline
       .atomic() // Ensures the commands are executed atomically
-      .cmd("XACK") // Acknowledge the task
+      .cmd("XDEL") // delete the task
       .arg(stream_name)
-      .arg(group_name)
       .arg(entry_id)
-      .ignore() // Ignore the result of XACK
+      .ignore() // Ignore the result of XDEL
       .cmd("XADD") // Re-add the task to the stream
       .arg(stream_name)
       .arg("*")
@@ -507,17 +518,17 @@ async fn push_task(
   }
 }
 
-async fn xack_task(
+async fn delete_task(
   redis_client: &mut ConnectionManager,
   stream_name: &str,
-  group_name: &str,
+  _group_name: &str,
   entry_id: &str,
 ) -> Result<(), ImportError> {
   let _: () = redis_client
-    .xack(stream_name, group_name, &[entry_id])
+    .xdel(stream_name, &[entry_id])
     .await
     .map_err(|e| {
-      error!("Failed to acknowledge task: {:?}", e);
+      error!("Failed to delete import task: {:?}", e);
       ImportError::Internal(e.into())
     })?;
   Ok(())
@@ -586,7 +597,11 @@ async fn process_task(
                 "[Import]: {} deleted unzip file: {:?}",
                 task.workspace_id, unzip_dir_path
               ),
-              Err(err) => error!("Failed to delete unzip file: {:?}", err),
+              Err(err) => {
+                if err.kind() != ErrorKind::NotFound {
+                  error!("Failed to delete unzip file: {:?}", err);
+                }
+              },
             }
           });
         },

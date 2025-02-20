@@ -37,6 +37,9 @@ pub enum AppError {
   #[error("Invalid password:{0}")]
   InvalidPassword(String),
 
+  #[error("Invalid page data:{0}")]
+  InvalidPageData(String),
+
   #[error("{0}")]
   OAuthError(String),
 
@@ -64,10 +67,8 @@ pub enum AppError {
   #[error("Not Logged In:{0}")]
   NotLoggedIn(String),
 
-  #[error(
-    "User:{user} does not have permissions to execute this action in workspace:{workspace_id}"
-  )]
-  NotEnoughPermissions { user: String, workspace_id: String },
+  #[error("User does not have permissions to execute this action")]
+  NotEnoughPermissions,
 
   #[error("s3 response error:{0}")]
   S3ResponseError(String),
@@ -187,6 +188,9 @@ pub enum AppError {
 
   #[error("Apply update error:{0}")]
   ApplyUpdateError(String),
+
+  #[error("{0}")]
+  InvalidBlock(String),
 }
 
 impl AppError {
@@ -253,6 +257,7 @@ impl AppError {
       AppError::InvalidContentType(_) => ErrorCode::InvalidContentType,
       AppError::InvalidPublishedOutline(_) => ErrorCode::InvalidPublishedOutline,
       AppError::InvalidFolderView(_) => ErrorCode::InvalidFolderView,
+      AppError::InvalidPageData(_) => ErrorCode::InvalidPageData,
       AppError::NotInviteeOfWorkspaceInvitation(_) => ErrorCode::NotInviteeOfWorkspaceInvitation,
       AppError::MissingView(_) => ErrorCode::MissingView,
       AppError::AccessRequestAlreadyExists { .. } => ErrorCode::AccessRequestAlreadyExists,
@@ -267,6 +272,7 @@ impl AppError {
       AppError::DecodeUpdateError(_) => ErrorCode::DecodeUpdateError,
       AppError::ApplyUpdateError(_) => ErrorCode::ApplyUpdateError,
       AppError::ActionTimeout(_) => ErrorCode::ActionTimeout,
+      AppError::InvalidBlock(_) => ErrorCode::InvalidBlock,
     }
   }
 }
@@ -430,6 +436,13 @@ pub enum ErrorCode {
   DecodeUpdateError = 1055,
   ApplyUpdateError = 1056,
   ActionTimeout = 1057,
+  AIImageResponseLimitExceeded = 1058,
+  MailerError = 1059,
+  LicenseError = 1060,
+  AIMaxRequired = 1061,
+  InvalidPageData = 1062,
+  MemberNotFound = 1063,
+  InvalidBlock = 1064,
 }
 
 impl ErrorCode {

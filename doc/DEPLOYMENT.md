@@ -68,34 +68,16 @@ cp deploy.env .env
 ```
 
 - Kindly read through the comments for each option
-- Modify the values in `.env` according to your needs
+- Modify the values in `.env` according to your needs. Minimally, you will have to update $FQDN
+  to match your host server's domain, unless you are deploying on localhost.
 
-For authentication details, refer to the [Authentication](./AUTHENTICATION.md) documentation. You will need to update
-the
-redirect URI to match your host server's public IP or hostname, such
-as `http://<your-host-server-public-ip-or-hostname>/gotrue/callback`.
-If using localhost, then just keep the default value.
+If you would like to use one of the identity providers to log in, refer to the [Authentication](./AUTHENTICATION.md) documentation.
 
-```bash
-GOTRUE_EXTERNAL_GOOGLE_ENABLED=true
-GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID=
-GOTRUE_EXTERNAL_GOOGLE_SECRET=
-GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI=http://your-host/gotrue/callback
+If you would like to use magic link to log in, you will need to set up env variables related to SMTP.
 
-# GitHub OAuth2
-GOTRUE_EXTERNAL_GITHUB_ENABLED=true
-GOTRUE_EXTERNAL_GITHUB_CLIENT_ID=your-github-client-id
-GOTRUE_EXTERNAL_GITHUB_SECRET=your-github-secret
-GOTRUE_EXTERNAL_GITHUB_REDIRECT_URI=http://your-host/gotrue/callback
-
-# Discord OAuth2
-GOTRUE_EXTERNAL_DISCORD_ENABLED=true
-GOTRUE_EXTERNAL_DISCORD_CLIENT_ID=your-discord-client-id
-GOTRUE_EXTERNAL_DISCORD_SECRET=your-discord-secret
-GOTRUE_EXTERNAL_DISCORD_REDIRECT_URI=http://your-host/gotrue/callback
-```
-
-### 3. Running the services
+If neither of the above are configured, then the only was to sign in is via the admin portal (the home page), using the admin email
+and password. After logging in as an admin, you can add users and set their passwords. The new user will be able to login to the admin
+portal using this credential.
 
 #### Start and run AppFlowy-Cloud
 
@@ -116,19 +98,15 @@ docker ps -a
 We have provided optional services in the file `docker-compose-extra.yml`.
 You do not need them for a fully functional installation of AppFlowy Cloud, but they could be helpful for various
 admin/debug tasks.
+We include all services in the file `docker-compose.yml`. It is easier to start all services and remove orphan containers warning message.
 
 - `pgadmin` (Web UI to visualize the provided postgres database)
 - `portainer`/`portainer_init` (Web UI to provide some monitoring and ease of container management)
 - `tunnel` (Cloudflare tunnel to provide a secure way to connect AppFlowy to Cloudflare without a publicly routable IP
   address)
-- `admin_frontend` (admin portal to manage accounts and add authentication methods. We recommend to keep this)
-  If you wish to deploy those, edit the file accordingly and do:
-
 ```
 docker compose --file docker-compose-extras.yml up -d
 ```
-
-You may ignore the orphan containers warning message that docker will output.
 
 
 > When using the `docker compose up -d` command without specifying a tag, Docker Compose will pull the `latest`
@@ -157,15 +135,42 @@ docker logs <NAME>
 - Then, run `docker compose up -d` to start the services.
 - Alternatively, you can use a specific image tag instead of `latest`, and checkout the corresponding tag for
   the repository.
+- If you found that `nginx.conf` or `deploy.env` has been updated, please update your env and nginx configuration based on the change.
+- Sometimes there might be additional steps required for upgrade. Refer to the [upgrade notes](https://appflowy.com/docs/self-hosters-upgrade-notes)
+  for more information.
 
 ### 7. AppFlowy Web
+- AppFlowy Web is provided as part of the docker compose setup, and should work out of the box. It is accessible via `/app` or `/`.
+- For existing self hosters who upgraded their setup to include AppFlowy Web in the docker compose, `/` might redirect them to `/web`
+  instead of `/app`. This is because the home page `/` used to be occupied by the admin console, and redirects to `/web` by default.
+  The browser cache might need to be cleared to see the new behavior. Alternatively, just access the AppFlowy Web directly via `/app`.
 
-- AppFlowy Web is a Single Page Application (SPA) that calls the endpoints in  `appflowy_cloud`, and is assumed
-  to be served on a different origin that the one used for AppFlowy Cloud (eg. if you are hosting `appflowy cloud`
-  on `appflowy.home.com`, `appflowy_web` may be hosted on `web.appflowy.home.com`). The source code and deployment
-  guide can be found in this [repository](https://github.com/AppFlowy-IO/AppFlowy-Web).
-- To prevent CORS issues, you will need to change `set $appflowy_web "http://localhost:3000";` in `nginx/nginx.conf`
-  to the origin where you are hosting `appflowy_web`.
+- In order for login flow to succeed, we need to make sure that the necessary headers for redirect url can be passed
+  to AppFlowy Cloud. If you are using only the Nginx service running within the official docker compose setup, then
+  this is already taken care of and no further steps are required. Otherwise, if you have an external Nginx in front of
+  the service, then make sure that you have the following:
+  ```
+  proxy_pass_request_headers on;
+  underscores_in_headers on;
+  ```
+- You can also deploy AppFlowy Web on another domain, using tools such as Vercel, instead of using the existing docker compose setup.
+  You can follow the guide [here](https://appflowy.com/docs/self-host-appflowy-web-install-vercel).
+- If AppFlowy Web is served on a separate domain, you will need to modify the nginx conf to prevent CORS issues.
+  By default, we allow requests from `localhost:3000`, using, the configuration below:
+  ```
+  map $http_origin $cors_origin {
+    # AppFlowy Web origin
+    "~^http://localhost:3000$" $http_origin;
+    default "null";
+  }
+  ```
+  Replace `http://localhost:3000` with your AppFlowy Web origin.
+- If you wish to build you own AppFlowy Web docker image, then run the following commands from the root directory of this repository:
+  ```
+  docker build --build-arg VERSION=v<insert version here> docker/web -f docker/web/Dockerfile -t appflowy-web
+  ```
+  The available versions can be found on [AppFlowy Web repository](https://github.com/AppFlowy-IO/AppFlowy-Web).
+
 
 ## Ports
 
@@ -214,12 +219,6 @@ by setting the `GOTRUE_DISABLE_SIGNUP` environment variable to `true`.
 The default configuration assumes that TLS is used for SMTP, typically on port 465. If you are using STARTTLS, such as when
 using port 587, please change `APPFLOWY_MAILER_SMTP_TLS_KIND` to `opportunistic`.
 
-### Can I sign in using only using email and password?
-
-The AppFlowy clients currently do not support email and password sign in. However, you can login to the admin portal using the admin
-email and password. In the admin section, you can then add users and set their passwords. Subseqently, users can login to the portal
-using their email and password, and launch the AppFlowy client via the portal.
-
 ### What functionality will I lose if the SMTP server is not set up?
 
 Sign in via magic link will not be possible. Inviting users to workspace and accepting invitation will have to be
@@ -230,4 +229,8 @@ performed via the admin portal as opposed to links provided in emails.
 - Update the docker compose file such that the ports for `appflowy_cloud`, `gotrue`, and `admin_frontend` are mapped
   to different ports on the host server. If possible, use firewall to make sure that these ports are not accessible
   from the internet.
-- Update `proxy_pass` in `nginx/nginx.conf` to point to the above ports.
+- Update `proxy_pass` in `nginx/nginx.conf` to point to the above ports. Then adapt this configuration for your
+  existing Nginx configuration.
+
+### AppFlowy Web keeps redirecting to the desktop application after login.
+- Refer to the AppFlowy Web section in the deployment steps. Make sure that the necessary headers are present.

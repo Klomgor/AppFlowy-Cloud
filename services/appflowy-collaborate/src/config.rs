@@ -30,6 +30,7 @@ pub struct S3Setting {
   pub secret_key: Secret<String>,
   pub bucket: String,
   pub region: String,
+  pub presigned_url_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +191,7 @@ pub fn get_configuration() -> Result<Config, anyhow::Error> {
       secret_key: get_env_var("APPFLOWY_S3_SECRET_KEY", "minioadmin").into(),
       bucket: get_env_var("APPFLOWY_S3_BUCKET", "appflowy"),
       region: get_env_var("APPFLOWY_S3_REGION", ""),
+      presigned_url_endpoint: None,
     },
     gotrue: GoTrueSetting {
       jwt_secret: get_env_var("APPFLOWY_GOTRUE_JWT_SECRET", "hello456").into(),
@@ -209,7 +211,7 @@ pub fn get_configuration() -> Result<Config, anyhow::Error> {
     redis_uri: get_env_var("APPFLOWY_REDIS_URI", "redis://localhost:6379").into(),
     redis_worker_count: get_env_var("APPFLOWY_REDIS_WORKERS", "60").parse()?,
     ai: AISettings {
-      port: get_env_var("APPFLOWY_AI_SERVER_PORT", "5001").parse()?,
+      port: get_env_var("AI_SERVER_PORT", "5001").parse()?,
       host: get_env_var("AI_SERVER_HOST", "localhost"),
     },
   };
