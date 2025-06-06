@@ -48,6 +48,7 @@ use indexer::collab_indexer::IndexerProvider;
 use indexer::scheduler::{IndexerConfiguration, IndexerScheduler};
 use indexer::vector::embedder::get_open_ai_config;
 use infra::env_util::get_env_var;
+use infra::thread_pool::ThreadPoolNoAbortBuilder;
 use mailer::sender::Mailer;
 use snowflake::Snowflake;
 
@@ -248,12 +249,27 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
   let pg_listeners = Arc::new(PgListeners::new(&pg_pool).await?);
   // let collab_member_listener = pg_listeners.subscribe_collab_member_change();
 
+  let use_redis_ac_cache = get_env_var("APPFLOWY_ACCESS_CONTROL_REDIS_CACHE_ENABLED", "false")
+    .parse::<bool>()
+    .unwrap_or(false);
+
   info!(
-    "Setting up access controls, is_enable: {}",
-    &config.access_control.is_enabled
+    "Setting up access controls, is_enable: {}, use redis cache: {}",
+    &config.access_control.is_enabled, use_redis_ac_cache,
   );
-  let access_control =
-    AccessControl::new(pg_pool.clone(), metrics.access_control_metrics.clone()).await?;
+
+  let redis_uri = if use_redis_ac_cache {
+    Some(config.redis_uri.expose_secret().as_str())
+  } else {
+    None
+  };
+
+  let access_control = AccessControl::new(
+    pg_pool.clone(),
+    redis_uri,
+    metrics.access_control_metrics.clone(),
+  )
+  .await?;
 
   let user_cache = UserCache::new(pg_pool.clone()).await;
   let collab_access_control: Arc<dyn CollabAccessControl> =
@@ -268,6 +284,16 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     } else {
       Arc::new(NoOpsWorkspaceAccessControlImpl::new())
     };
+
+  // thread pool
+  let thread_pool = Arc::new(
+    ThreadPoolNoAbortBuilder::new()
+      .thread_name(|idx| format!("af-collab-worker-{}", idx))
+      .num_threads(4)
+      .build()
+      .expect("Failed to create collab thread pool"),
+  );
+
   let realtime_access_control: Arc<dyn RealtimeAccessControl> =
     if config.access_control.is_enabled && config.access_control.enable_realtime_access_control {
       Arc::new(RealtimeCollabAccessControlImpl::new(access_control))
@@ -275,6 +301,7 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
       Arc::new(NoOpsRealtimeCollabAccessControlImpl::new())
     };
   let collab_cache = CollabCache::new(
+    thread_pool.clone(),
     redis_conn_manager.clone(),
     pg_pool.clone(),
     s3_client.clone(),
@@ -326,6 +353,7 @@ pub async fn init_state(config: &Config, rt_cmd_tx: CLCommandSender) -> Result<A
     redis_conn_manager.clone(),
   );
   let collab_store = CollabStore::new(
+    thread_pool.clone(),
     collab_storage_access_control.clone(),
     collab_cache.clone().into(),
     redis_conn_manager.clone(),

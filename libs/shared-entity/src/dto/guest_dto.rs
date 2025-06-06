@@ -27,8 +27,14 @@ pub struct SharedViewDetails {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListSharedViewResponse {
+pub struct SharedViewDetailsRequest {
+  pub ancestor_view_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedViews {
   pub shared_views: Vec<SharedView>,
+  pub view_id_with_no_access: Vec<Uuid>,
 }
 
 pub struct SharedFolderView {
