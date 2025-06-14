@@ -24,6 +24,7 @@ use collab::core::collab::{default_client_id, Collab, CollabOptions};
 use collab_database::database::{
   gen_database_group_id, gen_database_id, gen_field_id, gen_row_id, Database, DatabaseContext,
 };
+use collab_database::database_trait::NoPersistenceDatabaseCollabService;
 use collab_database::entity::{CreateDatabaseParams, CreateViewParams, EncodedDatabase, FieldType};
 use collab_database::fields::select_type_option::{
   SelectOption, SelectOptionColor, SelectOptionIds, SingleSelectTypeOption,
@@ -37,7 +38,7 @@ use collab_database::views::{
   BoardLayoutSetting, CalendarLayoutSetting, DatabaseLayout, Group, GroupSetting, GroupSettingMap,
   LayoutSetting, LayoutSettings,
 };
-use collab_database::workspace_database::{NoPersistenceDatabaseCollabService, WorkspaceDatabase};
+use collab_database::workspace_database::WorkspaceDatabase;
 use collab_database::{database::DatabaseBody, rows::RowId};
 use collab_document::document::{Document, DocumentBody};
 use collab_document::document_data::default_document_data;
@@ -2308,10 +2309,9 @@ async fn get_page_collab_data_for_document(
   )
   .await
   .map_err(|err| {
-    AppError::Internal(anyhow::anyhow!(
-      "Unable to get page collab data for {}: {}",
-      view_id,
-      err
+    AppError::InvalidFolderView(format!(
+      "Unable to get latest collab for view {}: {}",
+      view_id, err
     ))
   })?;
   Ok(PageCollabData {

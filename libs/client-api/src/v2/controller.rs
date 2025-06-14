@@ -12,7 +12,6 @@ use collab_rt_protocol::CollabRef;
 use futures_core::Stream;
 use futures_util::stream::SplitSink;
 use shared_entity::response::AppResponseError;
-use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
@@ -22,6 +21,7 @@ use tokio_stream::StreamExt;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 use yrs::block::ClientID;
 
 #[derive(Clone)]
@@ -55,8 +55,8 @@ impl WorkspaceController {
     })
   }
 
-  pub fn consume_latest_changed_collab(&self) -> HashSet<ChangedCollab> {
-    self.actor.consume_latest_changed_collabs()
+  pub fn subscribe_changed_collab(&self) -> tokio::sync::broadcast::Receiver<ChangedCollab> {
+    self.actor.subscribe_changed_collab()
   }
 
   pub fn is_connected(&self) -> bool {
@@ -188,6 +188,7 @@ pub enum DisconnectedReason {
   MessageLoopEnd(Arc<str>),
   CannotHandleReceiveMessage(Arc<str>),
   UserDisconnect(Arc<str>),
+  ServerForceClose,
   Unauthorized(Arc<str>),
 }
 
@@ -206,6 +207,7 @@ impl Display for DisconnectedReason {
       },
       DisconnectedReason::UserDisconnect(reason) => write!(f, "user disconnect: {}", reason),
       DisconnectedReason::Unauthorized(reason) => write!(f, "unauthorized: {}", reason),
+      DisconnectedReason::ServerForceClose => write!(f, "server force close"),
     }
   }
 }
@@ -245,6 +247,16 @@ impl DisconnectedReason {
     matches!(
       self,
       Self::Unexpected(..) | Self::ResetWithoutClosingHandshake
+    )
+  }
+
+  pub fn retriable_when_editing(&self) -> bool {
+    matches!(
+      self,
+      Self::Unexpected(..)
+        | Self::ResetWithoutClosingHandshake
+        | DisconnectedReason::Unauthorized(_)
+        | DisconnectedReason::ReachMaximumRetry
     )
   }
 }
@@ -345,6 +357,7 @@ impl ReconnectTarget for WorkspaceControllerActor {
     WorkspaceControllerActor::handle_connect(&self, token).await
   }
 
+  #[instrument(level = "trace", skip_all)]
   fn set_disconnected(&self, reason: DisconnectedReason) {
     self.set_connection_status(ConnectionStatus::Disconnected {
       reason: Some(reason),

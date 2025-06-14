@@ -16,7 +16,7 @@ use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
 use appflowy_collaborate::ws2::{SessionInfo, WsSession};
 use appflowy_proto::{ServerMessage, WorkspaceNotification};
 use collab_rt_entity::user::{AFUserChange, RealtimeUser, UserMessage};
-use collab_rt_entity::RealtimeMessage;
+use collab_rt_entity::{max_sync_message_size, RealtimeMessage};
 use collab_stream::model::MessageId;
 use secrecy::Secret;
 use semver::Version;
@@ -156,7 +156,7 @@ pub async fn establish_ws_connection_v2(
     &request,
     payload,
   )
-  .frame_size(10 * 1024 * 1024)
+  .frame_size(max_sync_message_size())
   .start()
 }
 
@@ -180,7 +180,7 @@ async fn start_connect(
   match result {
     Ok(uid) => {
       debug!(
-        "🚀new websocket connect: uid={}, device_id={}, client_version:{}",
+        "🚀new websocket connecting: uid={}, device_id={}, client_version:{}",
         uid, device_id, client_app_version
       );
 
@@ -210,7 +210,10 @@ async fn start_connect(
         .frame_size(MAX_FRAME_SIZE * 2)
         .start()
       {
-        Ok(response) => Ok(response),
+        Ok(response) => {
+          trace!("🔵ws connection established: uid={}", uid);
+          Ok(response)
+        },
         Err(e) => {
           error!("🔴ws connection error: {:?}", e);
           Err(e)

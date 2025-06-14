@@ -1,5 +1,7 @@
 use super::disk_cache::CollabDiskCache;
 use super::mem_cache::{cache_exp_secs_from_collab_type, CollabMemCache};
+use crate::collab::cache::DECODE_SPAWN_THRESHOLD;
+use crate::config::get_env_var;
 use crate::CollabMetrics;
 use app_error::AppError;
 use appflowy_proto::{Rid, UpdateFlags};
@@ -11,54 +13,81 @@ use collab::entity::{EncodedCollab, EncoderVersion};
 use collab::preclude::Collab;
 use collab_entity::CollabType;
 use collab_stream::model::UpdateStreamMessage;
+use dashmap::DashSet;
 use database::file::s3_client_impl::AwsS3BucketClientImpl;
 use database_entity::dto::{
   CollabParams, CollabUpdateData, PendingCollabWrite, QueryCollab, QueryCollabResult,
 };
 use futures_util::{stream, StreamExt};
+use infra::thread_pool::ThreadPoolNoAbort;
 use itertools::{Either, Itertools};
 use sqlx::{PgPool, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, instrument};
 use uuid::Uuid;
 use yrs::updates::decoder::Decode;
 use yrs::updates::encoder::Encode;
 use yrs::{ReadTxn, StateVector, Update};
 
-/// Threshold for spawning background tasks for memory cache operations.
-const MEM_CACHE_SPAWN_THRESHOLD: usize = 4096; // 4KB
-
-#[derive(Clone)]
 pub struct CollabCache {
+  thread_pool: Arc<ThreadPoolNoAbort>,
   disk_cache: CollabDiskCache,
   mem_cache: CollabMemCache,
   s3_collab_threshold: usize,
   /// Threshold for spawning background tasks for memory cache operations.
   /// Data smaller than this will be processed on the current thread.
   /// Data larger than this will be spawned to avoid blocking.
-  mem_cache_spawn_threshold: usize,
+  small_collab_size: usize,
   metrics: Arc<CollabMetrics>,
+  /// List of dirty collabs that have pending updates in Redis and need to be flushed to disk.
+  dirty_collabs: DashSet<Uuid>,
 }
 
 impl CollabCache {
   pub fn new(
+    thread_pool: Arc<ThreadPoolNoAbort>,
     redis_conn_manager: redis::aio::ConnectionManager,
     pg_pool: PgPool,
     s3: AwsS3BucketClientImpl,
     metrics: Arc<CollabMetrics>,
     s3_collab_threshold: usize,
-  ) -> Self {
-    let mem_cache = CollabMemCache::new(redis_conn_manager.clone(), metrics.clone());
-    let disk_cache =
-      CollabDiskCache::new(pg_pool.clone(), s3, s3_collab_threshold, metrics.clone());
-    Self {
+  ) -> Arc<Self> {
+    let mem_cache = CollabMemCache::new(
+      thread_pool.clone(),
+      redis_conn_manager.clone(),
+      metrics.clone(),
+    );
+    let disk_cache = CollabDiskCache::new(
+      thread_pool.clone(),
+      pg_pool.clone(),
+      s3,
+      s3_collab_threshold,
+      metrics.clone(),
+    );
+
+    let small_collab_size = get_env_var("APPFLOWY_SMALL_COLLAB_SIZE", "4096")
+      .parse::<usize>()
+      .unwrap_or(DECODE_SPAWN_THRESHOLD);
+    Arc::new(Self {
+      thread_pool,
       disk_cache,
       mem_cache,
       s3_collab_threshold,
-      mem_cache_spawn_threshold: MEM_CACHE_SPAWN_THRESHOLD,
+      small_collab_size,
       metrics,
-    }
+      dirty_collabs: DashSet::new(),
+    })
+  }
+
+  pub fn mark_as_dirty(&self, object_id: Uuid) {
+    tracing::trace!("marking collab {} as dirty", object_id);
+    self.dirty_collabs.insert(object_id);
+  }
+
+  pub fn mark_as_clean(&self, object_id: &Uuid) {
+    tracing::trace!("marking collab {} as clean", object_id);
+    self.dirty_collabs.remove(object_id);
   }
 
   pub fn metrics(&self) -> &CollabMetrics {
@@ -79,7 +108,7 @@ impl CollabCache {
     // Separate small and large data for different processing strategies
     let (small_params, large_params): (Vec<_>, Vec<_>) = params_list
       .into_iter()
-      .partition(|params| params.encoded_collab_v1.len() <= self.mem_cache_spawn_threshold);
+      .partition(|params| params.encoded_collab_v1.len() <= self.small_collab_size);
 
     let timestamp = chrono::Utc::now().timestamp();
     for params in small_params {
@@ -157,7 +186,7 @@ impl CollabCache {
     let mem_cache = self.mem_cache.clone();
     let data_size = cloned_encode_collab.doc_state.len();
 
-    if data_size <= self.mem_cache_spawn_threshold {
+    if data_size <= self.small_collab_size {
       // For small data, process on current thread for efficiency
       mem_cache
         .insert_encode_collab(
@@ -183,11 +212,12 @@ impl CollabCache {
     Ok((rid, encode_collab))
   }
 
+  #[instrument(level = "debug", skip_all)]
   pub async fn get_full_collab(
     &self,
     workspace_id: &Uuid,
     query: QueryCollab,
-    from: &StateVector,
+    from: Option<StateVector>,
     encoding: EncoderVersion,
   ) -> Result<(Rid, EncodedCollab), AppError> {
     let object_id = query.object_id;
@@ -196,48 +226,70 @@ impl CollabCache {
       Err(AppError::RecordNotFound(_)) => (Rid::default(), None),
       Err(err) => return Err(err),
     };
-    let updates = self
-      .get_workspace_updates(workspace_id, Some(&object_id), Some(rid), None)
-      .await?;
-    tracing::trace!("replaying {} updates for {}", updates.len(), object_id);
-    if !updates.is_empty() {
-      let mut collab = match encoded_collab {
+
+    let from = from.unwrap_or_default();
+    if !self.dirty_collabs.contains(&object_id) {
+      // there are no pending updates for this collab, so we can return the cached value directly
+      tracing::trace!("no pending updates for collab: {}", object_id);
+      match encoded_collab {
+        Some(encoded_collab) if encoded_collab.doc_state.len() <= self.small_collab_size => {
+          return Ok((rid, encoded_collab));
+        },
         Some(encoded_collab) => {
+          // If the collab is large, we do not replay updates and return the snapshot only.
           let options = CollabOptions::new(object_id.to_string(), default_client_id())
             .with_data_source(match encoded_collab.version {
               EncoderVersion::V1 => DataSource::DocStateV1(encoded_collab.doc_state.into()),
               EncoderVersion::V2 => DataSource::DocStateV2(encoded_collab.doc_state.into()),
             });
-          Collab::new_with_options(CollabOrigin::Server, options)
-            .map_err(|err| AppError::Internal(err.into()))?
+          let collab = Collab::new_with_options(CollabOrigin::Server, options)
+            .map_err(|err| AppError::Internal(err.into()))?;
+          let tx = collab.transact();
+          let doc_state: Bytes = match encoded_collab.version {
+            EncoderVersion::V1 => tx.encode_diff_v1(&from),
+            EncoderVersion::V2 => tx.encode_diff_v2(&from),
+          }
+          .into();
+          return Ok((
+            rid,
+            EncodedCollab {
+              version: encoded_collab.version,
+              state_vector: encoded_collab.state_vector,
+              doc_state,
+            },
+          ));
         },
         None => {
-          let options = CollabOptions::new(object_id.to_string(), default_client_id());
-          Collab::new_with_options(CollabOrigin::Server, options)
-            .map_err(|err| AppError::Internal(err.into()))?
+          return Err(AppError::RecordNotFound(format!(
+            "Collab not found for object_id: {}",
+            object_id
+          )));
         },
-      };
-      {
-        let mut tx = collab.transact_mut();
-        for msg in updates {
-          if msg.object_id == object_id {
-            let update = match msg.update_flags {
-              UpdateFlags::Lib0v1 => Update::decode_v1(&msg.update),
-              UpdateFlags::Lib0v2 => Update::decode_v2(&msg.update),
-            }
-            .map_err(|err| AppError::DecodeUpdateError(err.to_string()))?;
-            tx.apply_update(update)
-              .map_err(|err| AppError::ApplyUpdateError(err.to_string()))?;
-          }
-        }
       }
-      let tx = collab.transact();
-      let state_vector = tx.state_vector().encode_v1();
-      encoded_collab = Some(match encoding {
-        EncoderVersion::V1 => EncodedCollab::new_v1(state_vector, tx.encode_diff_v1(from)),
-        EncoderVersion::V2 => EncodedCollab::new_v2(state_vector, tx.encode_diff_v2(from)),
-      });
     }
+
+    let updates = self
+      .get_workspace_updates(workspace_id, Some(&object_id), Some(rid), None)
+      .await?;
+
+    let size = encoded_collab
+      .as_ref()
+      .map(|v| v.doc_state.len())
+      .unwrap_or(0)
+      + updates.iter().map(|u| u.update.len()).sum::<usize>();
+
+    if !updates.is_empty() {
+      encoded_collab = if size <= self.small_collab_size {
+        // For small collab, replaying updates on the current thread
+        replaying_updates(encoding, object_id, encoded_collab, updates, &from)?
+      } else {
+        self
+          .thread_pool
+          .install(|| replaying_updates(encoding, object_id, encoded_collab, updates, &from))
+          .map_err(|err| AppError::Internal(err.into()))??
+      }
+    }
+
     match encoded_collab {
       Some(encoded_collab) => Ok((rid, encoded_collab)),
       None => Err(AppError::RecordNotFound(format!(
@@ -361,7 +413,7 @@ impl CollabCache {
     let data_size = encode_collab_data.len();
     let mem_cache = self.mem_cache.clone();
     let expiration_secs = cache_exp_secs_from_collab_type(&collab_type);
-    if data_size <= self.mem_cache_spawn_threshold {
+    if data_size <= self.small_collab_size {
       if let Err(err) = mem_cache
         .insert_encode_collab_data(
           &object_id,
@@ -388,6 +440,7 @@ impl CollabCache {
         }
       });
     }
+    self.mark_as_clean(&object_id);
   }
 
   pub async fn insert_encode_collab_to_disk(
@@ -417,6 +470,7 @@ impl CollabCache {
       .disk_cache
       .delete_collab(workspace_id, object_id)
       .await?;
+    self.mark_as_clean(object_id);
     Ok(())
   }
 
@@ -431,6 +485,7 @@ impl CollabCache {
     Ok(is_exist)
   }
 
+  #[instrument(level = "debug", skip_all)]
   pub async fn batch_insert_collab(
     &self,
     records: Vec<PendingCollabWrite>,
@@ -449,7 +504,7 @@ impl CollabCache {
     self.disk_cache.batch_insert_collab(records).await?;
     let (small_params, large_params): (Vec<_>, Vec<_>) = mem_cache_params
       .into_iter()
-      .partition(|(_, data, _)| data.len() <= self.mem_cache_spawn_threshold);
+      .partition(|(_, data, _)| data.len() <= self.small_collab_size);
 
     let now = chrono::Utc::now().timestamp();
     for (oid, data, expire) in small_params {
@@ -484,4 +539,56 @@ impl CollabCache {
 
     Ok(())
   }
+}
+
+#[inline]
+fn replaying_updates(
+  encoding: EncoderVersion,
+  object_id: Uuid,
+  mut encoded_collab: Option<EncodedCollab>,
+  updates: Vec<UpdateStreamMessage>,
+  from: &StateVector,
+) -> Result<Option<EncodedCollab>, AppError> {
+  tracing::trace!("replaying {} updates for {}", updates.len(), object_id);
+  let mut collab = match encoded_collab {
+    Some(encoded_collab) => {
+      let options = CollabOptions::new(object_id.to_string(), default_client_id())
+        .with_data_source(match encoded_collab.version {
+          EncoderVersion::V1 => DataSource::DocStateV1(encoded_collab.doc_state.into()),
+          EncoderVersion::V2 => DataSource::DocStateV2(encoded_collab.doc_state.into()),
+        });
+      Collab::new_with_options(CollabOrigin::Server, options)
+        .map_err(|err| AppError::Internal(err.into()))?
+    },
+    None => {
+      let options = CollabOptions::new(object_id.to_string(), default_client_id());
+      Collab::new_with_options(CollabOrigin::Server, options)
+        .map_err(|err| AppError::Internal(err.into()))?
+    },
+  };
+  {
+    let mut tx = collab.transact_mut();
+    for msg in updates {
+      if msg.object_id == object_id {
+        let update = match msg.update_flags {
+          UpdateFlags::Lib0v1 => Update::decode_v1(&msg.update),
+          UpdateFlags::Lib0v2 => Update::decode_v2(&msg.update),
+        }
+        .map_err(|err| AppError::DecodeUpdateError(err.to_string()))?;
+        tx.apply_update(update)
+          .map_err(|err| AppError::ApplyUpdateError(err.to_string()))?;
+      }
+    }
+  }
+  let tx = collab.transact();
+  encoded_collab = Some(match encoding {
+    EncoderVersion::V1 => {
+      EncodedCollab::new_v1(tx.state_vector().encode_v1(), tx.encode_diff_v1(from))
+    },
+    EncoderVersion::V2 => {
+      EncodedCollab::new_v2(tx.state_vector().encode_v2(), tx.encode_diff_v2(from))
+    },
+  });
+
+  Ok(encoded_collab)
 }

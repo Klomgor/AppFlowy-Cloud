@@ -191,6 +191,7 @@ impl CollabGroup {
           match res {
             Some(Ok((message_id, update))) => {
               state.metrics.observe_collab_stream_latency(message_id.timestamp_ms);
+              state.persister.storage.mark_as_editing(state.object_id);
               Self::handle_inbound_update(&state, update).await;
             },
             Some(Err(err)) => {
@@ -208,48 +209,48 @@ impl CollabGroup {
   }
 
   async fn handle_inbound_update(state: &CollabGroupState, update: CollabStreamUpdate) {
-    // update state vector based on incoming message
-    match Update::decode_v1(&update.data) {
-      Ok(update) => state
-        .state_vector
-        .write()
-        .await
-        .merge(update.state_vector()),
+    let sender = update.sender.clone();
+    match update.into_update() {
+      Ok(update) => {
+        state
+          .state_vector
+          .write()
+          .await
+          .merge(update.state_vector());
+
+        let seq_num = state.seq_no.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::trace!(
+          "broadcasting collab update from {} - seq_num: {}",
+          sender,
+          seq_num
+        );
+        let payload = Message::Sync(SyncMessage::Update(update.encode_v1())).encode_v1();
+        let message = BroadcastSync::new(sender, state.object_id.to_string(), payload, seq_num);
+        for mut e in state.subscribers.iter_mut() {
+          let subscription = e.value_mut();
+          if message.origin == subscription.collab_origin {
+            continue; // don't send update to its sender
+          }
+
+          if let Err(err) = subscription.sink.send(message.clone().into()).await {
+            tracing::debug!(
+              "failed to send collab `{}` update to `{}`: {}",
+              state.object_id,
+              subscription.collab_origin,
+              err
+            );
+          }
+
+          state.last_activity.store(Arc::new(Instant::now()));
+        }
+      },
       Err(err) => {
         tracing::error!(
           "received malformed update for collab `{}`: {}",
           state.object_id,
           err
         );
-        return;
       },
-    }
-
-    let seq_num = state.seq_no.fetch_add(1, Ordering::SeqCst) + 1;
-    tracing::trace!(
-      "broadcasting collab update from {} ({} bytes) - seq_num: {}",
-      update.sender,
-      update.data.len(),
-      seq_num
-    );
-    let payload = Message::Sync(SyncMessage::Update(update.data)).encode_v1();
-    let message = BroadcastSync::new(update.sender, state.object_id.to_string(), payload, seq_num);
-    for mut e in state.subscribers.iter_mut() {
-      let subscription = e.value_mut();
-      if message.origin == subscription.collab_origin {
-        continue; // don't send update to its sender
-      }
-
-      if let Err(err) = subscription.sink.send(message.clone().into()).await {
-        tracing::debug!(
-          "failed to send collab `{}` update to `{}`: {}",
-          state.object_id,
-          subscription.collab_origin,
-          err
-        );
-      }
-
-      state.last_activity.store(Arc::new(Instant::now()));
     }
   }
 
@@ -269,7 +270,7 @@ impl CollabGroup {
         res = updates.recv() => {
           match res {
             Some(awareness_update) => {
-              Self::handle_inbound_awareness(&state, awareness_update).await;
+              Self::handle_inbound_awareness(&state, &awareness_update).await;
             },
             None => {
               break;
@@ -281,13 +282,13 @@ impl CollabGroup {
     Ok(())
   }
 
-  async fn handle_inbound_awareness(state: &CollabGroupState, update: AwarenessStreamUpdate) {
+  async fn handle_inbound_awareness(state: &CollabGroupState, update: &AwarenessStreamUpdate) {
     tracing::trace!(
       "broadcasting awareness update from {} (contains {} clients)",
       update.sender,
       update.data.clients.len()
     );
-    let sender = update.sender;
+    let sender = &update.sender;
     let message = AwarenessSync::new(
       state.object_id.to_string(),
       Message::Awareness(update.data.encode_v1()).encode_v1(),
@@ -295,7 +296,7 @@ impl CollabGroup {
     );
     for mut e in state.subscribers.iter_mut() {
       let subscription = e.value_mut();
-      if sender == subscription.collab_origin {
+      if sender == &subscription.collab_origin {
         continue; // don't send update to its sender
       }
 
@@ -618,7 +619,7 @@ impl CollabGroup {
               }
             },
             Err(err) => {
-              tracing::warn!("[realtime]: failed to handled message: {}", msg_id);
+              tracing::warn!("[realtime]: failed to handled message: {}", err);
               state.metrics.apply_update_failed_count.inc();
 
               let code = Self::ack_code_from_error(&err);
@@ -646,7 +647,7 @@ impl CollabGroup {
           }
         },
         Err(e) => {
-          error!("{} => parse sync message failed: {:?}", state.object_id, e);
+          error!("{} => parse sync message failed: {}", state.object_id, e);
           break;
         },
       }
@@ -918,6 +919,7 @@ impl CollabPersister {
     // send updates to redis queue
     let update = CollabStreamUpdate::new(update, sender, UpdateFlags::default());
     let msg_id = self.update_sink.send(&update).await?;
+    self.storage.mark_as_editing(self.object_id);
     tracing::trace!(
       "persisted update for {} from {} ({} bytes) - msg id: {}",
       self.object_id,
@@ -1099,7 +1101,8 @@ impl CollabPersister {
       match self.collab_type {
         CollabType::Document => {
           let txn = collab.transact();
-          if let Some(text) = DocumentBody::from_collab(&collab).map(|body| body.paragraphs(txn)) {
+          if let Some(text) = DocumentBody::from_collab(&collab).map(|body| body.to_plain_text(txn))
+          {
             self.index_collab_content(text);
           }
         },
