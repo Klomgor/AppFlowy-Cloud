@@ -1,5 +1,6 @@
 use crate::error::StreamError;
 use crate::model::AwarenessStreamUpdate;
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, Client, RedisError, Value};
@@ -10,18 +11,19 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+type AwarenessSender = UnboundedSender<Arc<AwarenessStreamUpdate>>;
+type ScopedAwarenessSender = UnboundedSender<(Uuid, Arc<AwarenessStreamUpdate>)>;
+
 pub struct AwarenessGossip {
   conn: MultiplexedConnection,
-  collabs: Arc<DashMap<Uuid, UnboundedSender<AwarenessStreamUpdate>>>,
-  workspaces: Arc<DashMap<Uuid, UnboundedSender<(Uuid, AwarenessStreamUpdate)>>>,
+  collabs: Arc<DashMap<Uuid, AwarenessSender>>,
+  workspaces: Arc<DashMap<Uuid, ScopedAwarenessSender>>,
 }
 
 impl AwarenessGossip {
   pub async fn new(client: &Client) -> Result<Self, RedisError> {
-    let collabs: Arc<DashMap<Uuid, UnboundedSender<AwarenessStreamUpdate>>> =
-      Arc::new(DashMap::new());
-    let workspaces: Arc<DashMap<Uuid, UnboundedSender<(Uuid, AwarenessStreamUpdate)>>> =
-      Arc::new(DashMap::new());
+    let collabs: Arc<DashMap<Uuid, AwarenessSender>> = Arc::new(DashMap::new());
+    let workspaces: Arc<DashMap<Uuid, ScopedAwarenessSender>> = Arc::new(DashMap::new());
     let mut pub_sub = client.get_async_pubsub().await?;
     pub_sub.psubscribe("af:awareness:*").await?;
     let conn = client.get_multiplexed_async_connection().await?;
@@ -39,7 +41,7 @@ impl AwarenessGossip {
                 &workspaces_clone,
                 workspace_id,
                 object_id,
-                awareness_update,
+                awareness_update.into(),
               );
             },
             Err(err) => tracing::error!("failed to parse awareness message: {}", err),
@@ -57,28 +59,25 @@ impl AwarenessGossip {
   }
 
   fn dispatch_collab_awareness_update(
-    collabs: &DashMap<Uuid, UnboundedSender<AwarenessStreamUpdate>>,
-    workspaces: &DashMap<Uuid, UnboundedSender<(Uuid, AwarenessStreamUpdate)>>,
+    collabs: &DashMap<Uuid, UnboundedSender<Arc<AwarenessStreamUpdate>>>,
+    workspaces: &DashMap<Uuid, UnboundedSender<(Uuid, Arc<AwarenessStreamUpdate>)>>,
     workspace_id: Uuid,
     object_id: Uuid,
-    awareness_update: AwarenessStreamUpdate,
+    awareness_update: Arc<AwarenessStreamUpdate>,
   ) {
-    // try new per-workspace awareness stream
-    if let Some(channel) = workspaces.get(&workspace_id) {
-      let channel = channel.value();
-      if channel.send((object_id, awareness_update)).is_err() {
-        workspaces.remove(&workspace_id);
+    if let Entry::Occupied(e) = workspaces.entry(workspace_id) {
+      // dispatch awareness update to workspace group (sync v2)
+      let channel = e.get();
+      if channel.send((object_id, awareness_update.clone())).is_err() {
+        e.remove();
       }
-    } else {
-      // fallback to per-collab awareness stream
-      let dropped = if let Some(channel) = collabs.get(&object_id) {
-        let channel = channel.value();
-        channel.send(awareness_update).is_err()
-      } else {
-        false
-      };
-      if dropped {
-        collabs.remove(&object_id);
+    }
+
+    // dispatch awareness update to collab group (sync v1)
+    if let Entry::Occupied(e) = collabs.entry(object_id) {
+      let channel = e.get();
+      if channel.send(awareness_update).is_err() {
+        e.remove();
       }
     }
   }
@@ -108,7 +107,7 @@ impl AwarenessGossip {
   pub fn collab_awareness_stream(
     &self,
     object_id: &Uuid,
-  ) -> UnboundedReceiver<AwarenessStreamUpdate> {
+  ) -> UnboundedReceiver<Arc<AwarenessStreamUpdate>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     self.collabs.insert(*object_id, tx);
     rx
@@ -117,7 +116,7 @@ impl AwarenessGossip {
   pub fn workspace_awareness_stream(
     &self,
     workspace_id: &Uuid,
-  ) -> UnboundedReceiverStream<(Uuid, AwarenessStreamUpdate)> {
+  ) -> UnboundedReceiverStream<(Uuid, Arc<AwarenessStreamUpdate>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     self.workspaces.insert(*workspace_id, tx);
     UnboundedReceiverStream::new(rx)

@@ -69,7 +69,7 @@ impl Workspace {
             msg.object_id,
             collab_type,
             sender.collab_origin.client_user_id().unwrap(),
-            &state_vector,
+            state_vector,
           )
           .await
         {
@@ -361,6 +361,7 @@ impl StreamHandler<anyhow::Result<UpdateStreamMessage>> for Workspace {
     let update_flags = msg.update_flags;
     let last_message_id = msg.last_message_id;
     let update = msg.update.clone();
+    store.mark_as_dirty(object_id);
 
     let sessions: Vec<WorkspaceSessionHandle> = self
       .sessions_by_client_id
@@ -403,8 +404,12 @@ impl StreamHandler<anyhow::Result<UpdateStreamMessage>> for Workspace {
   }
 }
 
-impl StreamHandler<(ObjectId, AwarenessStreamUpdate)> for Workspace {
-  fn handle(&mut self, (object_id, msg): (ObjectId, AwarenessStreamUpdate), _: &mut Self::Context) {
+impl StreamHandler<(ObjectId, Arc<AwarenessStreamUpdate>)> for Workspace {
+  fn handle(
+    &mut self,
+    (object_id, msg): (ObjectId, Arc<AwarenessStreamUpdate>),
+    _: &mut Self::Context,
+  ) {
     tracing::trace!(
       "received awareness update for {}/{}",
       self.workspace_id,

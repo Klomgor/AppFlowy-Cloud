@@ -3,6 +3,7 @@ use appflowy_collaborate::collab::storage::CollabAccessControlStorage;
 use collab::core::collab::{default_client_id, CollabOptions, DataSource};
 use collab::preclude::Collab;
 use collab_database::database::DatabaseBody;
+use collab_database::database_trait::NoPersistenceDatabaseCollabService;
 use collab_database::entity::FieldType;
 use collab_database::fields::type_option_cell_reader;
 use collab_database::fields::type_option_cell_writer;
@@ -18,7 +19,6 @@ use collab_database::rows::RowDetail;
 use collab_database::rows::RowId;
 use collab_database::rows::RowMetaKey;
 use collab_database::template::timestamp_parse::TimestampCellData;
-use collab_database::workspace_database::NoPersistenceDatabaseCollabService;
 use collab_database::workspace_database::WorkspaceDatabaseBody;
 use collab_document::document::Document;
 use collab_document::importer::md_importer::MDImporter;
@@ -236,9 +236,7 @@ pub async fn get_latest_collab_database_body(
   .await?;
   let db_body = DatabaseBody::from_collab(
     &db_collab,
-    Arc::new(NoPersistenceDatabaseCollabService {
-      client_id: default_client_id(),
-    }),
+    Arc::new(NoPersistenceDatabaseCollabService::new(default_client_id())),
     None,
   )
   .ok_or_else(|| {
