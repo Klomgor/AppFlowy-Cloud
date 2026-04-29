@@ -150,6 +150,14 @@ services:
       - ASSEMBLYAI_STREAMING_API_BASE=${ASSEMBLYAI_STREAMING_API_BASE}
       - APPFLOWY_SEARCH_SERVICE_URL=${APPFLOWY_SEARCH_SERVICE_URL:-http://appflowy_search:4002}
       - APPFLOWY_SEARCH_REQUEST_TIMEOUT_SECS=${APPFLOWY_SEARCH_REQUEST_TIMEOUT_SECS:-10}
+      - AI_ENABLED=${AI_ENABLED:-true}
+      # SIGNUP_WHITELIST_ENABLED=true requires GOTRUE_DISABLE_SIGNUP=false on
+      # the gotrue service. The whitelist is enforced by GoTrue's
+      # BeforeUserCreated PG hook, which never runs when signup is globally
+      # disabled — leaving the whitelist a no-op. Set GOTRUE_DISABLE_SIGNUP=false
+      # and rely on the whitelist + invitations to gate who can sign up.
+      - SIGNUP_WHITELIST_ENABLED=${SIGNUP_WHITELIST_ENABLED:-false}
+      - GUEST_INVITES_REQUIRE_ADMIN_APPROVAL=${GUEST_INVITES_REQUIRE_ADMIN_APPROVAL:-false}
     image: appflowyinc/appflowy_cloud:${APPFLOWY_CLOUD_VERSION:-latest}
     healthcheck:
       test: "curl --fail http://127.0.0.1:8000/api/health || exit 1"
